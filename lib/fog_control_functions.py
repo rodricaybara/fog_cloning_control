@@ -1,4 +1,46 @@
 # fog_control_functions.py
+#
+# Fase 1 (bugs críticos) - FOG Cloning Control
+# Autores: Fernando Gietz + Claude Sonnet 5
+#
+# Cambios de esta fase respecto al original (referencias a la numeración del
+# análisis previo, fog_cloning_control_analisis.md):
+#   - [1.1] CPU_OVERLOADED: faltaba declararla `global` junto al resto de
+#     estado del controlador, por lo que Python la trataba como variable
+#     local; al no existir rama para el rango CPU_THRESHOLD < CPU < CPU_LIMIT,
+#     esa franja (la más habitual en operación normal) provocaba un
+#     UnboundLocalError que mataba el proceso. Ahora, al declararla global,
+#     esa franja simplemente conserva el último estado conocido de
+#     CPU_OVERLOADED del ciclo anterior (histéresis intencionada), en vez de
+#     no estar definida.
+#   - [1.6] get_task_status(): un fallo real de consulta a MySQL (result is
+#     None) se traducía en un "0" silencioso, indistinguible de un 0 real.
+#     Ahora se devuelve None de forma explícita, y adjust_cloning_tasks()
+#     aborta el ciclo completo (sin escribir histórico ni tocar
+#     nfsGroupMembers) si detecta cualquier valor None en el estado de
+#     tareas, en vez de arrastrar el dato incompleto.
+#   - [1.7] get_cpu_usage(): dependía de un comando de shell con sustitución
+#     de procesos (<(...)), no garantizada bajo /bin/sh, y no comprobaba
+#     errores. Se sustituye por psutil.cpu_percent(interval=1), nativo y sin
+#     dependencia de shell externo.
+#   - [1.4 / 1.5] kib_per_read, kib_per_write y avio_ms en monitor_lvm_io():
+#     las fórmulas dividían por sectores en vez de por el número real de
+#     operaciones de E/S completadas (que antes ni siquiera se leían de
+#     /proc/diskstats). Se corrige get_io_stats() para capturar también
+#     reads/writes completadas, y se recalculan las métricas dividiendo por
+#     ese número de operaciones. Solo afecta al mensaje de log interno de
+#     monitor_lvm_io(); no cambia el esquema del CSV de histórico.
+#   - [1.10] manage_tasks(): se elimina el parámetro `task_limit` (siempre
+#     valía 1 y solo se usaba para un mensaje de log engañoso, ya que el
+#     paso real aplicado es ±2). Se sustituye por una constante TASK_STEP y
+#     se loguea el paso y el límite resultante real.
+#
+# Bugs críticos NO corregidos en esta fase (fuera de su alcance, ver
+# propuesta de refactorización):
+#   - [1.9] Reescritura no atómica de HISTORY_10_MINUTES_FILE: se resuelve
+#     en la Fase 2 eliminando por completo ese fichero.
+#   - Código muerto (FOGModelInterpreter, MODEL_PATHS, importlib.reload):
+#     se retira en la Fase 4.
 
 import os
 import sys
@@ -52,13 +94,19 @@ from DatabaseManager import DatabaseManager
 # Crear una instancia de DatabaseManager
 db_manager = DatabaseManager(MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE)
 
+# Paso de ajuste aplicado en cada incremento/decremento del límite de tareas.
+# (Antes vivía hardcodeado como "2" dentro de manage_tasks(); se saca a
+# constante para que el valor sea el mismo que se usa y el que se loguea.)
+TASK_STEP = 2
+
+
 def initialize_files(HISTORY_FILE, HISTORY_10_MINUTES_FILE, LOG_FILE):
     files = {
         HISTORY_FILE: "timestamp;cpu_usage;network_usage;active_tasks;unicast_download_active;unicast_upload_active;queued_tasks;unicast_download_queued;unicast_upload_queued;active_multicast;queued_multicast;task_limit;busy_percent;read_kib;write_kib;mb_read_per_sec;mb_write_per_sec;mariadb_cpu;php-fpm_cpu;nfsd_cpu;udp-sender_cpu;total_resources_cpu;unicast_files_download;multicast_files_download",
         HISTORY_10_MINUTES_FILE: "timestamp;cpu_usage;network_usage;active_tasks;unicast_download_active;unicast_upload_active;queued_tasks;unicast_download_queued;unicast_upload_queued;active_multicast;queued_multicast;task_limit;busy_percent;read_kib;write_kib;mb_read_per_sec;mb_write_per_sec;mariadb_cpu;php-fpm_cpu;nfsd_cpu;udp-sender_cpu;total_resources_cpu;unicast_files_download;multicast_files_download",
         LOG_FILE: "Fichero de log para FOG Cloning Control"
     }
-    
+
     for file, header in files.items():
         if not os.path.exists(file):
             with open(file, 'w') as f:
@@ -76,7 +124,19 @@ def get_io_stats(device, LOG_FILE):
             for line in f:
                 if device in line:
                     stats = line.split()
-                    return [int(stats[5]), int(stats[9]), int(stats[6]), int(stats[10]), int(stats[12])]
+                    # [1.4/1.5] Se añaden reads/writes completadas (antes no
+                    # se leían), necesarias para calcular KiB/operación y el
+                    # tiempo medio de E/S dividiendo por operaciones reales
+                    # en vez de por sectores.
+                    return [
+                        int(stats[3]),   # reads completadas
+                        int(stats[5]),   # sectores leídos
+                        int(stats[6]),   # ms empleados leyendo
+                        int(stats[7]),   # writes completadas
+                        int(stats[9]),   # sectores escritos
+                        int(stats[10]),  # ms empleados escribiendo
+                        int(stats[12]),  # ms totales haciendo E/S (busy time)
+                    ]
     except Exception as e:
         with open(LOG_FILE, 'a') as log:
             log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},Error: No se pudo leer las estadísticas de E/S para {device}: {str(e)}\n")
@@ -112,11 +172,13 @@ def monitor_lvm_io(DEVICE_NAME, LOG_FILE):
     final_time = time.time_ns()
 
     # Calcular diferencias y métricas
-    read_sectors = final_stats[0] - initial_stats[0]
-    write_sectors = final_stats[1] - initial_stats[1]
+    reads_completed = final_stats[0] - initial_stats[0]
+    read_sectors = final_stats[1] - initial_stats[1]
     read_time = final_stats[2] - initial_stats[2]
-    write_time = final_stats[3] - initial_stats[3]
-    io_time = final_stats[4] - initial_stats[4]
+    writes_completed = final_stats[3] - initial_stats[3]
+    write_sectors = final_stats[4] - initial_stats[4]
+    write_time = final_stats[5] - initial_stats[5]
+    io_time = final_stats[6] - initial_stats[6]
 
     elapsed_time = (final_time - initial_time) / 1e9
     if elapsed_time == 0:
@@ -127,11 +189,17 @@ def monitor_lvm_io(DEVICE_NAME, LOG_FILE):
     busy_percent = round(100 * io_time / (elapsed_time * 1000), 2)
     read_kib = round(bytes_to_kib(read_sectors * 512), 2)
     write_kib = round(bytes_to_kib(write_sectors * 512), 2)
-    kib_per_read = round(read_kib / (read_sectors / 2), 2) if read_sectors > 0 else 0
-    kib_per_write = round(write_kib / (write_sectors / 2), 2) if write_sectors > 0 else 0
+    # [1.4] Antes: read_kib / (read_sectors / 2), que da ~1.00 siempre
+    # (read_kib ya ES read_sectors/2). Ahora: KiB por operación real.
+    kib_per_read = round(read_kib / reads_completed, 2) if reads_completed > 0 else 0
+    kib_per_write = round(write_kib / writes_completed, 2) if writes_completed > 0 else 0
     mb_read_per_sec = round(kib_to_mb(read_kib / elapsed_time), 2)
     mb_write_per_sec = round(kib_to_mb(write_kib / elapsed_time), 2)
-    avio_ms = round((read_time + write_time) / (read_sectors + write_sectors), 2) if (read_sectors + write_sectors) > 0 else 0
+    # [1.5] Antes: (read_time + write_time) / (read_sectors + write_sectors).
+    # Ahora: tiempo medio por operación completada (equivalente a "await" de
+    # iostat), dividiendo por el número de operaciones, no de sectores.
+    total_ops = reads_completed + writes_completed
+    avio_ms = round((read_time + write_time) / total_ops, 2) if total_ops > 0 else 0
 
     log_message = f"LVM | {DEVICE_NAME} | busy {busy_percent:.2f}% | read {read_sectors} | write {write_sectors} | discrd 0 | KiB/r {kib_per_read:.2f} | KiB/w {kib_per_write:.2f} | KiB/d 0 | MBr/s {mb_read_per_sec:.2f} | MBw/s {mb_write_per_sec:.2f} | avio {avio_ms:.2f} ms"
     
@@ -180,13 +248,24 @@ def get_task_status():
     results = {}
     for key, query in queries.items():
         result = db_manager.execute_query(query)
-        if result:
-            results[key] = result[0][0]
+        # [1.6] Antes: `if result:` trataba `None` (fallo real de conexión o
+        # de consulta) exactamente igual que una lista vacía, y ambos casos
+        # se convertían en un "0" indistinguible de un 0 real. Ahora se
+        # distingue explícitamente el fallo (None) de una consulta que
+        # simplemente no devuelve filas.
+        if result is None:
+            results[key] = None
+        elif len(result) == 0:
+            results[key] = None
         else:
-            results[key] = 0
+            results[key] = result[0][0]
 
-    current_unicast_active = results["current_unicast_download_active"] + results["current_unicast_upload_active"]
-    current_unicast_queued = results["current_unicast_download_queued"] + results["current_unicast_upload_queued"]
+    current_unicast_active = results["current_unicast_download_active"] + results["current_unicast_upload_active"] \
+        if results["current_unicast_download_active"] is not None and results["current_unicast_upload_active"] is not None \
+        else None
+    current_unicast_queued = results["current_unicast_download_queued"] + results["current_unicast_upload_queued"] \
+        if results["current_unicast_download_queued"] is not None and results["current_unicast_upload_queued"] is not None \
+        else None
 
     return (
         current_unicast_active,
@@ -202,21 +281,25 @@ def get_task_status():
         results["multicast_files_download"]
     )
 
-def manage_tasks(action, task_limit, current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE):
-    with open(LOG_FILE, 'a') as log:
-        log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},Acción: {action}, Límite de tarea: {task_limit}\n")
-
+def manage_tasks(action, current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE):
     if action == "increase":
         if current_task_limit < MAX_TASKS:
-            new_task_limit = min(current_task_limit + 2, MAX_TASKS)
+            new_task_limit = min(current_task_limit + TASK_STEP, MAX_TASKS)
         else:
             new_task_limit = MAX_TASKS
     elif action == "decrease":
-        new_task_limit = max(current_task_limit - 2, MIN_TASKS)
+        new_task_limit = max(current_task_limit - TASK_STEP, MIN_TASKS)
     else:
         with open(LOG_FILE, 'a') as log:
             log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},Acción inválida: {action}\n")
         return False
+
+    # [1.10] Antes se logueaba "Límite de tarea: {task_limit}" con
+    # task_limit siempre a 1 (parámetro sin uso real, el paso aplicado
+    # siempre era ±2). Ahora se loguea el paso real (TASK_STEP) y el límite
+    # resultante calculado.
+    with open(LOG_FILE, 'a') as log:
+        log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},Acción: {action}, paso: {TASK_STEP}, límite actual: {current_task_limit}, límite propuesto: {new_task_limit}\n")
 
     if current_task_limit != new_task_limit:
         query = "UPDATE nfsGroupMembers SET ngmMaxClients=%s WHERE ngmID=1"
@@ -234,15 +317,36 @@ def manage_tasks(action, task_limit, current_task_limit, current_tasks, MIN_TASK
 def adjust_cloning_tasks(LOG_FILE, interpreter):
     # Función para obtener el uso de CPU
     def get_cpu_usage():
-        cmd = "awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){u1=u; t1=t;} else print ($2+$4-u1) * 100 / (t-t1); }' <(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat)"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return int(float(result.stdout.strip().split('.')[0]))
+        # [1.7] Antes: comando de shell con sustitución de procesos
+        # (<(...)), no garantizada bajo /bin/sh, sin comprobar returncode ni
+        # capturar excepciones; un fallo del comando producía un
+        # ValueError no controlado al hacer float('') sobre stdout vacío.
+        # Ahora: psutil, nativo, sin dependencia de shell externo. El
+        # `interval=1` ya bloquea 1s tomando una muestra real, igual que
+        # hacía el comando anterior.
+        return int(psutil.cpu_percent(interval=1))
 
     CPU_USAGE = get_cpu_usage()
     NETWORK_USAGE = calculate_network_usage()
 
     # Obtener el estado actual de las tareas
     task_status = get_task_status()
+
+    # [1.6] Si alguna consulta a MySQL ha fallado, get_task_status() ahora
+    # devuelve None en la posición correspondiente. No se debe continuar el
+    # ciclo con datos incompletos: se podría escribir una fila falsa en el
+    # histórico y, peor aún, manage_tasks() podría sobrescribir
+    # ngmMaxClients con un valor erróneo (p.ej. reducir drásticamente el
+    # límite real de tareas por culpa de un fallo de lectura transitorio).
+    # Se aborta el ciclo de forma segura, dejando constancia en el log.
+    if any(value is None for value in task_status):
+        with open(LOG_FILE, 'a') as f:
+            f.write(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')},"
+                    f"ERROR: no se pudo leer el estado de tareas desde MySQL en este ciclo "
+                    f"(alguna consulta ha fallado). Se omite este ciclo: no se escribe "
+                    f"histórico ni se ajusta el límite de tareas.\n")
+        return
+
     current_tasks_active_unicast, current_unicast_download_active, current_unicast_upload_active, \
     current_tasks_queued_unicast, current_unicast_download_queued, current_unicast_upload_queued, \
     current_tasks_active_Multicast, current_tasks_queued_Multicast, current_task_limit, \
@@ -321,7 +425,17 @@ def adjust_cloning_tasks(LOG_FILE, interpreter):
     error_cpu = avg_cpu_usage - CPU_LIMIT
     error_network = avg_network_usage - NETWORK_LIMIT
 
-    global integral_cpu, integral_network, last_cpu_error, last_network_error
+    # [1.1] Se añade CPU_OVERLOADED a la declaración global, junto al resto
+    # de estado del controlador. Antes, al asignarle valor más abajo sin
+    # declararla global, Python la trataba como variable local a la
+    # función; como no existe rama para el rango CPU_THRESHOLD < CPU_USAGE
+    # < CPU_LIMIT, esa franja (la más habitual en operación normal) dejaba
+    # la variable local sin asignar, y la siguiente línea
+    # (`if CPU_OVERLOADED == 0:`) lanzaba UnboundLocalError, matando el
+    # proceso. Con la declaración global, esa franja intermedia
+    # simplemente conserva el último estado conocido (histéresis
+    # intencionada), en vez de no estar definida.
+    global integral_cpu, integral_network, last_cpu_error, last_network_error, CPU_OVERLOADED
 
     integral_cpu += error_cpu
     integral_network += error_network
@@ -345,6 +459,8 @@ def adjust_cloning_tasks(LOG_FILE, interpreter):
         CPU_OVERLOADED = 0
         with open(LOG_FILE, 'a') as f:
             f.write(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, Reducir tareas. Uso de CPU por debajo del {CPU_THRESHOLD}%\n")
+    # Entre CPU_THRESHOLD y CPU_LIMIT (ambos excluidos): no se reasigna
+    # CPU_OVERLOADED a propósito, se mantiene el último estado conocido.
 
     # Incrementar o decrementar según el estado
     if CPU_OVERLOADED == 0:
@@ -354,7 +470,7 @@ def adjust_cloning_tasks(LOG_FILE, interpreter):
             if task_difference < 2:
                 action = "Aumentar"
                 reason = f"Recursos disponibles (CPU: {CPU_USAGE}%, Red: {NETWORK_USAGE} bps)"
-                manage_tasks("increase", 1, current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE)
+                manage_tasks("increase", current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE)
             elif task_difference > 2:
                 if current_task_limit <= MIN_TASKS:
                     action = "Mantener"
@@ -362,14 +478,14 @@ def adjust_cloning_tasks(LOG_FILE, interpreter):
                 else:
                     action = "Reducir"
                     reason = f"Diferencia de tareas mayor a 2 ({task_difference})"
-                    manage_tasks("decrease", 1, current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE)
+                    manage_tasks("decrease", current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE)
             else:
                 action = "Mantener"
                 reason = f"Diferencia de tareas es 2 ({task_difference})"
         else:
             action = "Reducir"
             reason = f"Uso de CPU alto ({CPU_USAGE}%)"
-            manage_tasks("decrease", 1, current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE)
+            manage_tasks("decrease", current_task_limit, current_tasks, MIN_TASKS, MAX_TASKS, LOG_FILE)
     else:
         action = "Mantener"
         reason = "El sistema está sobrecargado"
